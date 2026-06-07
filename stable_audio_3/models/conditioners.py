@@ -288,6 +288,7 @@ class MultiConditioner(nn.Module):
         output = {}
 
         for key, conditioner in self.conditioners.items():
+            print(f"Conditioner key: {key}")
             condition_key = key
 
             conditioner_inputs = []

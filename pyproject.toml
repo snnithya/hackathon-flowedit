@@ -16,6 +16,7 @@ dependencies = [
     "huggingface-hub>=1.7.1",
     "transformers>=5.8.0",
     "soundfile>=0.13.1",
+    "scipy>=1.13.1",
 ]
 
 [project.optional-dependencies]
@@ -68,3 +69,6 @@ exclude = [
     "stable_audio_3/training",
     "optimized",
 ]
+
+[tool.uv]
+cache-dir = ".uv-cache"

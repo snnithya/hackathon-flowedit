@@ -169,3 +169,5 @@ wandb/*
 .DS_Store
 *.safetensors
 .claude
+
+.uv-cache

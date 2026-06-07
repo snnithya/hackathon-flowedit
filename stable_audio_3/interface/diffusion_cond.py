@@ -23,7 +23,7 @@ _LENGTH_EXTRACT_RE = re.compile(r' Length: (\d+) seconds\.?\s*$')
 
 
 # when using a prompt in a filename
-def condense_prompt(prompt):
+def condense_prompt(    ):
     pattern = r'[\\/:*?"<>|]'
     # Replace special characters with hyphens
     prompt = re.sub(pattern, '-', prompt)

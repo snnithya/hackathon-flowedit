@@ -17,3 +17,4 @@ def compile(function, *args, **kwargs):
             return function
 
     return function
+
