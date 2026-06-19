@@ -605,9 +605,8 @@ def main(args):
     interface.launch(
         share=args.share,
         auth=(args.username, args.password) if args.username is not None else None,
-        server_port=7881,
-        
-        =True,
+        server_port=7882,
+        prevent_thread_lock=True,
     )
     _mount_api(interface)
     interface.block_thread()
