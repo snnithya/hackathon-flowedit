@@ -1,23 +1,27 @@
-"""Standalone Gradio interface for FlowEdit (deterministic inverse + LFE only).
+"""Hugging Face Space entrypoint for FlowEdit (deterministic inverse + LFE only).
+
+This is a self-contained copy of the standalone FlowEdit Gradio app, adapted to
+run on a Hugging Face Space:
+  - the model is loaded once at import time (Spaces has no CLI args),
+  - the interface binds to the host/port that HF injects via env vars,
+  - the optional /generate FastAPI route is mounted after launch.
+
+The `stable_audio_3` package is installed from a pinned git tag (see
+requirements.txt), so the FlowEdit inference code is version-locked.
 
 Runs a single FlowEdit pass and shows NUM_COLS=10 outputs arranged in two
 rows of COLS_PER_ROW=5:
   - (NUM_COLS - 1) = 9 intermediate latents decoded at steps chosen by:
-      • t=0.95 forced (always the second step, regardless of σ/center), and
+      • t=0.95 forced (always the second step, regardless of sigma/center), and
       • 8 additional steps drawn from a Gaussian centred at `sample_center`
         (default 0.5) with spread `sample_std` along the t-schedule
-        (t=1 noisy → t=0 clean).
+        (t=1 noisy -> t=0 clean).
   - 1 final decoded output (rightmost column, second row).
-
-The `sample_std` slider lets you control how concentrated the intermediate
-captures are around the centre:
-  - small σ → all captures cluster tightly around the centre t-value
-  - large σ → captures spread toward both ends of the trajectory
 """
 
-import argparse
 import gc
 import json
+import os
 
 import gradio as gr
 import numpy as np
@@ -36,6 +40,10 @@ model = None
 sample_rate = 44100
 sample_size = 2097152
 model_half = True
+
+# Which pretrained model to load. Override via the SAO_MODEL Space variable.
+# "medium" requires GPU hardware; "small-music"/"small-sfx" run on CPU.
+PRETRAINED_NAME = os.environ.get("SAO_MODEL", "medium")
 
 # Number of output columns: (NUM_COLS - 1) intermediates + 1 final.
 # Rendered as two rows of COLS_PER_ROW each.
@@ -90,8 +98,8 @@ def _gaussian_step_indices(
     The remaining (n_samples - len(forced)) indices are drawn via evenly-spaced
     Gaussian quantiles centred at `center` with spread `std`.
 
-    The t-schedule runs t=1 (noisy) → t=0 (clean).
-    t → step_index:  ind = round((1 - t) * (lfe_steps - 1))
+    The t-schedule runs t=1 (noisy) -> t=0 (clean).
+    t -> step_index:  ind = round((1 - t) * (lfe_steps - 1))
     """
     if lfe_steps <= 0:
         return []
@@ -115,10 +123,7 @@ def _gaussian_step_indices(
 
 
 def load_model(
-    model_config=None,
-    model_ckpt_path=None,
     pretrained_name=None,
-    pretransform_ckpt_path=None,
     device="cuda",
     in_model_half=False,
 ):
@@ -127,24 +132,10 @@ def load_model(
     if pretrained_name is not None:
         model = StableAudioModel.from_pretrained(pretrained_name, device=device, model_half=in_model_half)
     else:
-        raise ValueError("No pretrained model or model config provided")
-
-    # sample_rate = model.sample_rate
-    # sample_size = model.model_config["sample_size"]
-
-    # if pretransform_ckpt_path is not None:
-    #     print(f"Loading pretransform checkpoint from {pretransform_ckpt_path}")
-    #     model.pretransform.load_state_dict(
-    #         load_ckpt_state_dict(pretransform_ckpt_path), strict=False
-    #     )
-
-    # model.to(device).eval().requires_grad_(False)
-    # if in_model_half:
-    #     model.to(torch.float16)
-    # model_half = in_model_half
+        raise ValueError("No pretrained model provided")
 
     print("Done loading model")
-    return model, model_config
+    return model
 
 
 def _prepare_init_audio(init_audio_input):
@@ -273,8 +264,6 @@ def generate_edit(
     sample_center      = _to_float(sample_center,       0.5)
     sample_std         = _to_float(sample_std,          0.15)
     seconds_total      = _to_int(seconds_total,         30)
-    # if not src_prompt or not tar_prompt:
-    #     raise gr.Error("Please provide both a source and a target prompt.")
 
     device = next(model.model.parameters()).device
 
@@ -314,8 +303,6 @@ def generate_edit(
         torch.cuda.empty_cache()
     gc.collect()
 
-    
-
     seed = int(seed) if seed and seed.strip() else -1
     if seed == -1:
         seed = int(np.random.randint(0, 2**32 - 1, dtype=np.uint32))
@@ -332,7 +319,6 @@ def generate_edit(
     # Corresponding t-values for display (t = 1 - ind/(lfe_steps-1))
     t_labels = [round(1.0 - idx / max(lfe_steps - 1, 1), 3) for idx in step_indices]
     print(f"[gradio_flowedit] capturing steps {step_indices} (t={t_labels})")
-
 
     sampled, intermediate_sampled = _run_flowedit(
         src_conditioning_inputs=src_conditioning_inputs,
@@ -403,7 +389,6 @@ def create_edit_ui(gradio_title=""):
                     src_inv_cfg = gr.Slider(0.0, 25.0, value=1.0, step=0.1, label="src_inv_cfg_scale")
                     tar_inv_cfg = gr.Slider(0.0, 25.0, value=5.0, step=0.1, label="tar_inv_cfg_scale")
 
-
                 with gr.Accordion("Edit params", open=False):
                     with gr.Row():
                         lfe_steps = gr.Slider(1, 200, value=20, step=1, label="fe_steps")
@@ -416,7 +401,7 @@ def create_edit_ui(gradio_title=""):
                         )
                         sample_std = gr.Slider(
                             0.01, 0.5, value=0.15, step=0.01,
-                            label="Intermediate sample spread (σ; small=clustered, large=spread)",
+                            label="Intermediate sample spread (sigma; small=clustered, large=spread)",
                         )
                     seed_textbox = gr.Textbox(label="Seed (-1 for random)", value="-1")
 
@@ -580,48 +565,17 @@ def _mount_api(interface):
     print("[api] /generate mounted on Gradio app")
 
 
-def main(args):
-    torch.manual_seed(42)
+# --- Space entrypoint: load once at import, then launch ---------------------
+torch.manual_seed(42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+load_model(pretrained_name=PRETRAINED_NAME, in_model_half=True, device=device)
 
-    if args.model_config is not None:
-        with open(args.model_config) as f:
-            cfg = json.load(f)
-    else:
-        cfg = None
+demo = create_edit_ui(gradio_title=os.environ.get("SAO_TITLE", "FlowEdit"))
+demo.queue()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    load_model(
-        model_config=cfg,
-        model_ckpt_path=args.ckpt_path,
-        pretrained_name=args.pretrained_name,
-        pretransform_ckpt_path=args.pretransform_ckpt_path,
-        in_model_half=args.model_half,
-        device=device,
-    )
-
-    interface = create_edit_ui(gradio_title=args.title or "FlowEdit")
-    interface.queue()
-    interface.launch(
-        share=args.share,
-        auth=(args.username, args.password) if args.username is not None else None,
-        server_port=7882,
-        prevent_thread_lock=True,
-    )
-    _mount_api(interface)
-    interface.block_thread()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run FlowEdit gradio interface")
-    parser.add_argument("--pretrained-name", type=str, required=False)
-    parser.add_argument("--model-config", type=str, required=False)
-    parser.add_argument("--ckpt-path", type=str, required=False)
-    parser.add_argument("--pretransform-ckpt-path", type=str, required=False)
-    parser.add_argument("--share", action="store_true")
-    parser.add_argument("--username", type=str, required=False)
-    parser.add_argument("--password", type=str, required=False)
-    parser.add_argument("--model-half", action="store_true", default=True)
-    parser.add_argument("--title", type=str, required=False, default="FlowEdit")
-    args = parser.parse_args()
-    main(args)
+# HF Spaces sets GRADIO_SERVER_NAME/GRADIO_SERVER_PORT; launch picks them up.
+# prevent_thread_lock lets us mount the extra FastAPI route, then we block.
+demo.launch(prevent_thread_lock=True)
+_mount_api(demo)
+demo.block_thread()

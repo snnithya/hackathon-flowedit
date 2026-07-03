@@ -469,6 +469,117 @@ def create_edit_ui(gradio_title=""):
     return ui
 
 
+def _mount_api(interface):
+    """Mount /generate on the Gradio app's FastAPI instance.
+
+    Mirrors the logic in generate_edit() but accepts/returns base64 audio
+    so the FastAPI backend can call it through any tunnel without file serving.
+    """
+    import base64
+    import io as _io
+    import traceback as _tb
+
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
+
+    @interface.app.post("/generate")
+    async def api_generate(request: Request):
+        import asyncio
+        try:
+            body = await request.json()
+
+            src_prompt   = body["src_prompt"]
+            tar_prompt   = body["tar_prompt"]
+            lfe_steps    = int(body.get("lfe_steps", 20))
+            n_avg        = int(body.get("n_avg", 10))
+            src_cfg      = float(body.get("src_lfe_cfg_scale", 1.0))
+            tar_cfg      = float(body.get("tar_lfe_cfg_scale", 3.0))
+            num_inter    = int(body.get("num_intermediates", 9))
+            center       = float(body.get("sample_center", 0.5))
+            std          = float(body.get("sample_std", 0.15))
+            seed         = int(body.get("seed", -1))
+            seconds_total = int(body.get("seconds_total", 30))
+
+            # Decode audio and build init_audio_input tuple
+            audio_bytes = base64.b64decode(body["audio_b64"])
+            waveform, in_sr = torchaudio.load(_io.BytesIO(audio_bytes))
+            # _prepare_init_audio expects (sr, numpy array) with shape (samples, channels)
+            init_audio_input = (in_sr, waveform.numpy().T)
+
+            device = next(model.model.parameters()).device
+            batch_size = 1
+
+            init_audio = _prepare_init_audio(init_audio_input)
+            input_len = init_audio[1].shape[-1]
+            run_sample_size = _aligned_sample_size(input_len)
+
+            # Build conditioning (same as generate_edit)
+            src_cond_raw, _ = model._build_conditioning_dicts(src_prompt, None, seconds_total, batch_size)
+            tar_cond_raw, _ = model._build_conditioning_dicts(tar_prompt, None, seconds_total, batch_size)
+
+            latent_sample_size = run_sample_size // model.model.pretransform.downsampling_ratio
+            io_channels = model.model.io_channels
+            inpaint_mask = torch.zeros(batch_size, 1, latent_sample_size, device=device)
+            inpaint_masked_input = torch.zeros(batch_size, io_channels, latent_sample_size, device=device)
+
+            src_cond = model.model.conditioner(src_cond_raw, device)
+            src_cond["inpaint_mask"] = [inpaint_mask]
+            src_cond["inpaint_masked_input"] = [inpaint_masked_input]
+            src_cond = model.model.get_conditioning_inputs(src_cond)
+
+            tar_cond = model.model.conditioner(tar_cond_raw, device)
+            tar_cond["inpaint_mask"] = [inpaint_mask]
+            tar_cond["inpaint_masked_input"] = [inpaint_masked_input]
+            tar_cond = model.model.get_conditioning_inputs(tar_cond)
+
+            if seed == -1:
+                seed = int(np.random.randint(0, 2**32 - 1, dtype=np.uint32))
+
+            step_indices = _gaussian_step_indices(
+                lfe_steps=lfe_steps, n_samples=num_inter, center=center, std=std,
+            )
+            t_labels = [round(1.0 - idx / max(lfe_steps - 1, 1), 3) for idx in step_indices]
+
+            sampled, intermediate_sampled = await asyncio.to_thread(
+                _run_flowedit,
+                src_conditioning_inputs=src_cond,
+                tar_conditioning_inputs=tar_cond,
+                init_audio=init_audio,
+                device=device,
+                seed=seed,
+                src_inv_cfg_scale=src_cfg,
+                tar_inv_cfg_scale=tar_cfg,
+                lfe_steps=lfe_steps,
+                n_avg=n_avg,
+                intermediate_latents_steps=step_indices,
+                run_sample_size=run_sample_size,
+            )
+
+            def to_b64(tensor):
+                t = tensor[..., :input_len]
+                audio = rearrange(t, "b d n -> d (b n)").to(torch.float32).cpu()
+                peak = audio.abs().max().clamp(min=1e-8)
+                audio_int16 = audio.div(peak).clamp(-1, 1).mul(32767).to(torch.int16)
+                buf = _io.BytesIO()
+                torchaudio.save(buf, audio_int16, sample_rate, format="wav")
+                return base64.b64encode(buf.getvalue()).decode()
+
+            return JSONResponse({
+                "intermediates": [
+                    {"label": f"t={t}", "audio_b64": to_b64(inter)}
+                    for t, inter in zip(t_labels, intermediate_sampled)
+                ],
+                "final": {"label": "Final", "audio_b64": to_b64(sampled)},
+                "seed": seed,
+            })
+        except Exception as e:
+            tb = _tb.format_exc()
+            print(f"[api] /generate ERROR:\n{tb}")
+            return JSONResponse({"error": str(e), "traceback": tb}, status_code=500)
+
+    print("[api] /generate mounted on Gradio app")
+
+
 def main(args):
     torch.manual_seed(42)
 
@@ -494,8 +605,11 @@ def main(args):
     interface.launch(
         share=args.share,
         auth=(args.username, args.password) if args.username is not None else None,
-        server_port=7881,
+        server_port=7882,
+        prevent_thread_lock=True,
     )
+    _mount_api(interface)
+    interface.block_thread()
 
 
 if __name__ == "__main__":

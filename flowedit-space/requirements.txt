@@ -1,0 +1,7 @@
+# torch/torchaudio wheels are pulled from the CUDA 12.6 index (matches pyproject).
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+# Pin the FlowEdit library to an immutable git tag so inference code is locked.
+# Create the tag first:  git tag flowedit-v0.1.0 && git push cloned flowedit-v0.1.0
+# The [ui] extra pulls gradio==6.3.0, matplotlib, accelerate.
+stable-audio-3[ui] @ git+https://github.com/snnithya/hackathon-flowedit.git@flowedit-v0.1.0
