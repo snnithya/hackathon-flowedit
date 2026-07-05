@@ -1,5 +1,9 @@
-# torch/torchaudio wheels are pulled from the CUDA 12.6 index (matches pyproject).
---extra-index-url https://download.pytorch.org/whl/cu126
+# ZeroGPU runs on Blackwell (sm_120) GPUs, which need CUDA 12.8 kernels.
+# The cu126 build of torch only ships up to sm_90, so pin the cu128 build of the
+# same 2.7.1 version (still satisfies stable-audio-3's torch==2.7.1 requirement).
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1+cu128
+torchaudio==2.7.1+cu128
 
 # Pin the FlowEdit library to an immutable git tag so inference code is locked.
 # Create the tag first:  git tag flowedit-v0.1.0 && git push cloned flowedit-v0.1.0

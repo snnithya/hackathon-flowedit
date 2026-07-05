@@ -20,8 +20,24 @@ rows of COLS_PER_ROW=5:
 """
 
 import gc
-import json
 import os
+
+# `spaces` must be imported before torch on ZeroGPU. When it's not installed
+# (local dev / dedicated GPU), fall back to a no-op @spaces.GPU decorator.
+try:
+    import spaces
+except ImportError:  # pragma: no cover
+    class _SpacesShim:
+        @staticmethod
+        def GPU(*d_args, **d_kwargs):
+            def _decorator(fn):
+                return fn
+            # Support both @spaces.GPU and @spaces.GPU(duration=...)
+            if len(d_args) == 1 and callable(d_args[0]) and not d_kwargs:
+                return d_args[0]
+            return _decorator
+
+    spaces = _SpacesShim()
 
 import gradio as gr
 import numpy as np
@@ -134,6 +150,10 @@ def load_model(
     else:
         raise ValueError("No pretrained model provided")
 
+    # Keep the module-level flag in sync with how the model actually loaded, so
+    # _prepare_init_audio casts input audio to a matching dtype.
+    model_half = model.model_half
+
     print("Done loading model")
     return model
 
@@ -228,6 +248,69 @@ def _run_flowedit(
     return sampled, intermediate_sampled
 
 
+@spaces.GPU(duration=120)
+def _generate_core(
+    init_audio,
+    run_sample_size,
+    src_prompt,
+    tar_prompt,
+    src_cfg,
+    tar_cfg,
+    lfe_steps,
+    n_avg,
+    seconds_total,
+    step_indices,
+    seed,
+    batch_size=1,
+):
+    """All GPU-bound work for one edit, run inside a ZeroGPU allocation.
+
+    On ZeroGPU a physical GPU only exists for the duration of this call, so the
+    text conditioning and the FlowEdit sampling both live here. Results are moved
+    to CPU before returning so callers can format them outside the GPU context.
+    """
+    device = "cuda"
+
+    src_conditioning_inputs, _ = model._build_conditioning_dicts(
+        src_prompt, None, seconds_total, batch_size
+    )
+    tar_conditioning_inputs, _ = model._build_conditioning_dicts(
+        tar_prompt, None, seconds_total, batch_size
+    )
+
+    latent_sample_size = run_sample_size // model.model.pretransform.downsampling_ratio
+    io_channels = model.model.io_channels
+    inpaint_mask = torch.zeros(batch_size, 1, latent_sample_size, device=device)
+    inpaint_masked_input = torch.zeros(batch_size, io_channels, latent_sample_size, device=device)
+
+    src_conditioning_inputs = model.model.conditioner(src_conditioning_inputs, device)
+    src_conditioning_inputs["inpaint_mask"] = [inpaint_mask]
+    src_conditioning_inputs["inpaint_masked_input"] = [inpaint_masked_input]
+    src_conditioning_inputs = model.model.get_conditioning_inputs(src_conditioning_inputs)
+    tar_conditioning_inputs = model.model.conditioner(tar_conditioning_inputs, device)
+    tar_conditioning_inputs["inpaint_mask"] = [inpaint_mask]
+    tar_conditioning_inputs["inpaint_masked_input"] = [inpaint_masked_input]
+    tar_conditioning_inputs = model.model.get_conditioning_inputs(tar_conditioning_inputs)
+
+    sampled, intermediate_sampled = _run_flowedit(
+        src_conditioning_inputs=src_conditioning_inputs,
+        tar_conditioning_inputs=tar_conditioning_inputs,
+        init_audio=init_audio,
+        device=device,
+        seed=seed,
+        src_inv_cfg_scale=src_cfg,
+        tar_inv_cfg_scale=tar_cfg,
+        lfe_steps=lfe_steps,
+        n_avg=n_avg,
+        intermediate_latents_steps=step_indices,
+        run_sample_size=run_sample_size,
+    )
+
+    sampled = sampled.detach().to("cpu")
+    intermediate_sampled = [x.detach().to("cpu") for x in intermediate_sampled]
+    return sampled, intermediate_sampled
+
+
 def generate_edit(
     init_audio_input,
     src_inv_cfg_scale,
@@ -265,9 +348,8 @@ def generate_edit(
     sample_std         = _to_float(sample_std,          0.15)
     seconds_total      = _to_int(seconds_total,         30)
 
-    device = next(model.model.parameters()).device
-
     # Prepare init audio first so we can size the whole run to the input's duration.
+    # This is CPU-only work; the GPU pass happens in _generate_core.
     print(f"Preparing init audio: {init_audio_input}")
     init_audio = _prepare_init_audio(init_audio_input)
     input_len = init_audio[1].shape[-1]
@@ -278,29 +360,6 @@ def generate_edit(
         f"({run_sample_size / sample_rate:.2f}s)"
     )
 
-    src_conditioning_inputs, _ = model._build_conditioning_dicts(
-                src_prompt, None, seconds_total, batch_size
-            )
-    tar_conditioning_inputs, _ = model._build_conditioning_dicts(
-                tar_prompt, None, seconds_total, batch_size
-            )
-
-    latent_sample_size = run_sample_size // model.model.pretransform.downsampling_ratio
-    io_channels = model.model.io_channels
-    inpaint_mask = torch.zeros(batch_size, 1, latent_sample_size, device=device)
-    inpaint_masked_input = torch.zeros(batch_size, io_channels, latent_sample_size, device=device)
-
-    src_conditioning_inputs = model.model.conditioner(src_conditioning_inputs, device)
-    src_conditioning_inputs["inpaint_mask"] = [inpaint_mask]
-    src_conditioning_inputs["inpaint_masked_input"] = [inpaint_masked_input]
-    src_conditioning_inputs = model.model.get_conditioning_inputs(src_conditioning_inputs)
-    tar_conditioning_inputs = model.model.conditioner(tar_conditioning_inputs, device)
-    tar_conditioning_inputs["inpaint_mask"] = [inpaint_mask]
-    tar_conditioning_inputs["inpaint_masked_input"] = [inpaint_masked_input]
-    tar_conditioning_inputs = model.model.get_conditioning_inputs(tar_conditioning_inputs)
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
     gc.collect()
 
     seed = int(seed) if seed and seed.strip() else -1
@@ -320,18 +379,19 @@ def generate_edit(
     t_labels = [round(1.0 - idx / max(lfe_steps - 1, 1), 3) for idx in step_indices]
     print(f"[gradio_flowedit] capturing steps {step_indices} (t={t_labels})")
 
-    sampled, intermediate_sampled = _run_flowedit(
-        src_conditioning_inputs=src_conditioning_inputs,
-        tar_conditioning_inputs=tar_conditioning_inputs,
+    sampled, intermediate_sampled = _generate_core(
         init_audio=init_audio,
-        device=device,
-        seed=seed,
-        src_inv_cfg_scale=src_inv_cfg_scale,
-        tar_inv_cfg_scale=tar_inv_cfg_scale,
+        run_sample_size=run_sample_size,
+        src_prompt=src_prompt,
+        tar_prompt=tar_prompt,
+        src_cfg=src_inv_cfg_scale,
+        tar_cfg=tar_inv_cfg_scale,
         lfe_steps=lfe_steps,
         n_avg=n_avg,
-        intermediate_latents_steps=step_indices,
-        run_sample_size=run_sample_size,
+        seconds_total=seconds_total,
+        step_indices=step_indices,
+        seed=seed,
+        batch_size=batch_size,
     )
 
     audio_list = []
@@ -469,7 +529,6 @@ def _mount_api(interface):
 
     @interface.app.post("/generate")
     async def api_generate(request: Request):
-        import asyncio
         try:
             body = await request.json()
 
@@ -491,31 +550,12 @@ def _mount_api(interface):
             # _prepare_init_audio expects (sr, numpy array) with shape (samples, channels)
             init_audio_input = (in_sr, waveform.numpy().T)
 
-            device = next(model.model.parameters()).device
             batch_size = 1
 
+            # CPU-only prep; the GPU pass runs inside _generate_core (ZeroGPU).
             init_audio = _prepare_init_audio(init_audio_input)
             input_len = init_audio[1].shape[-1]
             run_sample_size = _aligned_sample_size(input_len)
-
-            # Build conditioning (same as generate_edit)
-            src_cond_raw, _ = model._build_conditioning_dicts(src_prompt, None, seconds_total, batch_size)
-            tar_cond_raw, _ = model._build_conditioning_dicts(tar_prompt, None, seconds_total, batch_size)
-
-            latent_sample_size = run_sample_size // model.model.pretransform.downsampling_ratio
-            io_channels = model.model.io_channels
-            inpaint_mask = torch.zeros(batch_size, 1, latent_sample_size, device=device)
-            inpaint_masked_input = torch.zeros(batch_size, io_channels, latent_sample_size, device=device)
-
-            src_cond = model.model.conditioner(src_cond_raw, device)
-            src_cond["inpaint_mask"] = [inpaint_mask]
-            src_cond["inpaint_masked_input"] = [inpaint_masked_input]
-            src_cond = model.model.get_conditioning_inputs(src_cond)
-
-            tar_cond = model.model.conditioner(tar_cond_raw, device)
-            tar_cond["inpaint_mask"] = [inpaint_mask]
-            tar_cond["inpaint_masked_input"] = [inpaint_masked_input]
-            tar_cond = model.model.get_conditioning_inputs(tar_cond)
 
             if seed == -1:
                 seed = int(np.random.randint(0, 2**32 - 1, dtype=np.uint32))
@@ -525,19 +565,21 @@ def _mount_api(interface):
             )
             t_labels = [round(1.0 - idx / max(lfe_steps - 1, 1), 3) for idx in step_indices]
 
-            sampled, intermediate_sampled = await asyncio.to_thread(
-                _run_flowedit,
-                src_conditioning_inputs=src_cond,
-                tar_conditioning_inputs=tar_cond,
+            # Called directly (not via a thread): ZeroGPU only exposes a GPU
+            # inside the decorated function on the main process.
+            sampled, intermediate_sampled = _generate_core(
                 init_audio=init_audio,
-                device=device,
-                seed=seed,
-                src_inv_cfg_scale=src_cfg,
-                tar_inv_cfg_scale=tar_cfg,
+                run_sample_size=run_sample_size,
+                src_prompt=src_prompt,
+                tar_prompt=tar_prompt,
+                src_cfg=src_cfg,
+                tar_cfg=tar_cfg,
                 lfe_steps=lfe_steps,
                 n_avg=n_avg,
-                intermediate_latents_steps=step_indices,
-                run_sample_size=run_sample_size,
+                seconds_total=seconds_total,
+                step_indices=step_indices,
+                seed=seed,
+                batch_size=batch_size,
             )
 
             def to_b64(tensor):
@@ -566,6 +608,8 @@ def _mount_api(interface):
 
 
 # --- Space entrypoint: load once at import, then launch ---------------------
+# On ZeroGPU, `spaces` makes CUDA appear available at import so the model can be
+# constructed on "cuda"; the real GPU is only attached inside @spaces.GPU calls.
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
