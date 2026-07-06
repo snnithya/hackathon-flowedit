@@ -1,11 +1,12 @@
-# ZeroGPU runs on Blackwell (sm_120) GPUs, which need CUDA 12.8 kernels.
-# The cu126 build of torch only ships up to sm_90, so pin the cu128 build of the
-# same 2.7.1 version (still satisfies stable-audio-3's torch==2.7.1 requirement).
---extra-index-url https://download.pytorch.org/whl/cu128
-torch==2.7.1+cu128
-torchaudio==2.7.1+cu128
+# ZeroGPU (Blackwell / sm_120) only accepts torch 2.8.0 / 2.9.1 / 2.10.0 / 2.11.0
+# and supplies its own CUDA build, so pin a plain version WITHOUT a +cuXXX label
+# or an extra index (a local label makes ZeroGPU's version check reject it).
+torch==2.8.0
+torchaudio==2.8.0
 
 # Pin the FlowEdit library to an immutable git tag so inference code is locked.
-# Create the tag first:  git tag flowedit-v0.1.0 && git push cloned flowedit-v0.1.0
+# NOTE: this tag must include the relaxed torch>=2.8.0 pin in pyproject.toml.
+# Re-tag after committing that change:
+#   git tag flowedit-v0.1.1 && git push cloned flowedit-v0.1.1
 # The [ui] extra pulls gradio==6.3.0, matplotlib, accelerate.
-stable-audio-3[ui] @ git+https://github.com/snnithya/hackathon-flowedit.git@flowedit-v0.1.0
+stable-audio-3[ui] @ git+https://github.com/snnithya/hackathon-flowedit.git@flowedit-v0.1.1
