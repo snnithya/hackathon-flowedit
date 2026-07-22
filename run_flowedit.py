@@ -50,7 +50,7 @@ def _pad(lst, n, fill=None):
 
 def _t_to_step(t: float, lfe_steps: int) -> int:
     """Convert a t-value in [0, 1] to the nearest LFE step index."""
-    return int(np.clip(np.round((1.0 - t) * (lfe_steps - 1)), 0, lfe_steps - 1))
+    return int(np.clip(np.round((1.0 - t) * (lfe_steps)), 0, lfe_steps))
 
 
 def _aligned_sample_size(num_samples: int) -> int:
@@ -82,7 +82,7 @@ def _gaussian_step_indices(
     n_samples: int,
     center: float = 0.5,
     std: float = 0.15,
-    forced_t_values: tuple = (0.95,),
+    forced_t_values: tuple = (),
 ):
     """Return a sorted list of LFE step indices.
 
@@ -105,7 +105,7 @@ def _gaussian_step_indices(
     n_gaussian = max(0, n_samples - len(forced_set))
     gaussian_set = set()
     if n_gaussian > 0:
-        quantiles = np.linspace(1 / (n_gaussian + 1), n_gaussian / (n_gaussian + 1), n_gaussian)
+        quantiles = np.linspace(1 / (n_gaussian), 1, n_gaussian)
         t_values = scipy_norm.ppf(quantiles, loc=center, scale=std)
         t_values = np.clip(t_values, 0.0, 1.0)
         for t in t_values:
@@ -229,6 +229,7 @@ def _run_flowedit(
         lfe_steps=int(lfe_steps),
         return_intermediate_latents=True,
         intermediate_latents_steps=intermediate_latents_steps,
+        noise_amt=0,
     )
 
     if torch.cuda.is_available():
@@ -330,7 +331,7 @@ def generate_edit(
         std=sample_std,
     )
     # Corresponding t-values for display (t = 1 - ind/(lfe_steps-1))
-    t_labels = [round(1.0 - idx / max(lfe_steps - 1, 1), 3) for idx in step_indices]
+    t_labels = [round(1.0 - idx / max(lfe_steps, 1), 3) for idx in step_indices]
     print(f"[gradio_flowedit] capturing steps {step_indices} (t={t_labels})")
 
 

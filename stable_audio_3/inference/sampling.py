@@ -549,6 +549,7 @@ def generate_diffusion_latent_flowedit(
         return_intermediate_latents = False,
         intermediate_latents_interval = 5,
         intermediate_latents_steps = None,
+        inv_cfg_tradeoff_schedule: tp.Optional[str] = 'linear',
         **sampler_kwargs
         ) -> torch.Tensor: 
     """
@@ -626,33 +627,46 @@ def generate_diffusion_latent_flowedit(
     tar_conditioning_inputs = {k: v.type(model_dtype) if v is not None else v for k, v in tar_conditioning_inputs.items()}
     tar_conditioning_inputs_lfe = {k: v.expand(n_avg, *v.shape[1:]).type(model_dtype) if v is not None else v for k, v in tar_conditioning_inputs.items()} # allowing batch processing of latent flowedit
     intermediate_latents = []
+
+    z_t_inv = init_audio.clone()
+
+    if inv_steps > 0 and noise_amt > 0.0:
+        if deterministic_inverse:
+            dt = 1.0 / inv_steps
+            for ind, i in enumerate(np.linspace(0, noise_amt, inv_steps+1)[:-1]):
+                t = torch.Tensor([i]).repeat(n_avg).to(device)
+                z_t_inv = z_t_inv + dt * model.model(z_t_inv, t, **src_conditioning_inputs, cfg_scale=src_inv_cfg_scale)
+        else:
+            noise = torch.randn_like(z_t_inv).to(device)
+            z_t_inv = (1 - noise_amt) * init_audio + noise_amt * noise
+        
     
-    if lfe_steps > 0:
+    if lfe_steps > 0 and noise_amt < 1.0:
         # print('in latent flowedit')
         # latent flowedit
-        z_t_lfe = init_audio.unsqueeze(0).repeat(n_avg, 1, 1, 1) # (n_avg, batch_size, channels, length)??
+        z_s_lfe = z_t_inv.unsqueeze(0).repeat(n_avg, 1, 1, 1) # (n_avg, batch_size, channels, length)??
         # print('z_t_lfe.shape', z_t_lfe.shape)
         _capture_steps_set = set(intermediate_latents_steps) if intermediate_latents_steps is not None else None
         
         for ind, i in enumerate(np.linspace(1, 0, lfe_steps+1)[:-1]):
-            t = torch.Tensor([i]).repeat(n_avg).to(device)
-            noise = torch.randn_like(z_t_lfe).to(device)
-            z_t_src = (1 - i) * init_audio + i * noise
+            s = torch.Tensor([i]).repeat(n_avg).to(device)
+            noise = torch.randn_like(z_s_lfe).to(device)
+            z_s_src = (1 - i) * init_audio + i * noise
     
-            z_t_tar = (z_t_lfe) - init_audio + z_t_src
+            z_s_tar = z_s_src + z_s_lfe - init_audio.unsqueeze(0).repeat(n_avg, 1, 1, 1)
             # z_t_tar = z_t_tar.view(-1, *z_t_tar.shape[2:]) # (n_avg * batch_size, channels, length)
 
-            z_t_src = z_t_src.view(-1, *z_t_src.shape[2:]) # (n_avg * batch_size, channels, length)
-            z_t_tar = z_t_tar.view(-1, *z_t_tar.shape[2:]) # (n_avg * batch_size, channels, length)
+            z_s_src = z_s_src.view(-1, *z_s_src.shape[2:]) # (n_avg * batch_size, channels, length)
+            z_s_tar = z_s_tar.view(-1, *z_s_tar.shape[2:]) # (n_avg * batch_size, channels, length)
 
-            v_tar = model.model(z_t_tar, t, **tar_conditioning_inputs_lfe, cfg_scale=tar_lfe_cfg_scale)
-            v_src = model.model(z_t_src, t, **src_conditioning_inputs_lfe, cfg_scale=src_lfe_cfg_scale)
-            v_delta = v_tar - v_src
+            v_s_tar = model.model(z_s_tar, s, **tar_conditioning_inputs_lfe, cfg_scale=tar_lfe_cfg_scale)
+            v_s_src = model.model(z_s_src, s, **src_conditioning_inputs_lfe, cfg_scale=src_lfe_cfg_scale)
+            v_delta = v_s_tar - v_s_src
 
             v_delta = v_delta.view(n_avg, batch_size, *v_delta.shape[1:])
             v_delta = v_delta.mean(0, keepdim=True) # (1, batch_size, channels, length)
             
-            z_t_lfe = z_t_lfe - v_delta/lfe_steps
+            z_s_lfe = z_s_lfe - (1 - noise_amt) * v_delta/lfe_steps
             if return_intermediate_latents:
                 _capture = (
                     ind in _capture_steps_set
@@ -660,11 +674,31 @@ def generate_diffusion_latent_flowedit(
                     else ind % intermediate_latents_interval == 0
                 )
                 if _capture:
-                    intermediate_latents.append(z_t_lfe[0].clone())
-        sampled = z_t_lfe[0]
+                    intermediate_latents.append(z_s_lfe[0].clone())
+        z_s_lfe = z_s_lfe[0]
+
+    if inv_steps > 0 and noise_amt > 0.0:
+        z_t_inv = z_s_lfe
+        dt = 1.0 / inv_steps
+        for ind, i in enumerate(np.linspace(noise_amt, 0, inv_steps+1)[:-1]):
+            t = torch.Tensor([i]).to(device)
+            z_t_inv = z_t_inv + dt * model.model(z_t_inv, t, **tar_conditioning_inputs, cfg_scale=tar_inv_cfg_scale)
+    else:
+        z_t_inv = z_s_lfe
+
+    sampled = z_t_inv
 
     intermediate_sampled = []
     if return_intermediate_latents:
+        if inv_cfg_tradeoff_schedule is not None:
+            if inv_cfg_tradeoff_schedule == "linear":
+                inv_cfg_tradeoff_schedule = np.linspace(1, 0, inv_steps+1)[:-1]
+            elif inv_cfg_tradeoff_schedule == "cosine":
+                inv_cfg_tradeoff_schedule = np.cos(np.linspace(0, np.pi/2, inv_steps+1)[:-1])
+            elif inv_cfg_tradeoff_schedule == "step":
+                inv_cfg_tradeoff_schedule = np.where(np.linspace(0, 1, inv_steps+1)[:-1] < 0.5, 0, 1)
+            else:
+                raise ValueError(f"Unknown inv_cfg_tradeoff_schedule: {inv_cfg_tradeoff_schedule}")
         for ind, intermediate_latent in enumerate(intermediate_latents):
             if model.pretransform is not None:
                 intermediate_latent_val = intermediate_latent.to(next(model.pretransform.parameters()).dtype)
