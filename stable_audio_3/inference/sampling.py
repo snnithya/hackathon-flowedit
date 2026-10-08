@@ -530,8 +530,11 @@ def generate_diffusion_latent_flowedit(
         tar_inv_cfg_scale=6,
         src_lfe_cfg_scale=6,
         tar_lfe_cfg_scale=6,
+        lfe_cfg_scale=6,
         src_conditioning_inputs: dict = {},
         tar_conditioning_inputs: dict = {},
+        src_conditioning_inputs_tensors: dict = {},
+        tar_conditioning_inputs_tensors: dict = {},
         tar_prompt: str = "",
         n_avg: int = 1,
         batch_size: int = 1,
@@ -632,9 +635,9 @@ def generate_diffusion_latent_flowedit(
 
     if inv_steps > 0 and noise_amt > 0.0:
         if deterministic_inverse:
-            dt = 1.0 / inv_steps
-            for ind, i in enumerate(np.linspace(0, noise_amt, inv_steps+1)[:-1]):
-                t = torch.Tensor([i]).repeat(n_avg).to(device)
+            dt = noise_amt / inv_steps
+            for ind, i in enumerate(np.linspace(0, noise_amt, inv_steps+1)[1:]):
+                t = torch.Tensor([i]).repeat(z_t_inv.shape[0]).to(device)
                 z_t_inv = z_t_inv + dt * model.model(z_t_inv, t, **src_conditioning_inputs, cfg_scale=src_inv_cfg_scale)
         else:
             noise = torch.randn_like(z_t_inv).to(device)
@@ -653,7 +656,7 @@ def generate_diffusion_latent_flowedit(
             noise = torch.randn_like(z_s_lfe).to(device)
             z_s_src = (1 - i) * init_audio + i * noise
     
-            z_s_tar = z_s_src + z_s_lfe - init_audio.unsqueeze(0).repeat(n_avg, 1, 1, 1)
+            z_s_tar = z_s_src + (z_s_lfe - z_t_inv.unsqueeze(0).repeat(n_avg, 1, 1, 1))/(1 - noise_amt)
             # z_t_tar = z_t_tar.view(-1, *z_t_tar.shape[2:]) # (n_avg * batch_size, channels, length)
 
             z_s_src = z_s_src.view(-1, *z_s_src.shape[2:]) # (n_avg * batch_size, channels, length)
@@ -661,12 +664,12 @@ def generate_diffusion_latent_flowedit(
 
             v_s_tar = model.model(z_s_tar, s, **tar_conditioning_inputs_lfe, cfg_scale=tar_lfe_cfg_scale)
             v_s_src = model.model(z_s_src, s, **src_conditioning_inputs_lfe, cfg_scale=src_lfe_cfg_scale)
-            v_delta = v_s_tar - v_s_src
+            v_delta = (1 - noise_amt) * (v_s_tar - v_s_src)
 
             v_delta = v_delta.view(n_avg, batch_size, *v_delta.shape[1:])
             v_delta = v_delta.mean(0, keepdim=True) # (1, batch_size, channels, length)
             
-            z_s_lfe = z_s_lfe - (1 - noise_amt) * v_delta/lfe_steps
+            z_s_lfe = z_s_lfe - v_delta/lfe_steps
             if return_intermediate_latents:
                 _capture = (
                     ind in _capture_steps_set
@@ -674,33 +677,58 @@ def generate_diffusion_latent_flowedit(
                     else ind % intermediate_latents_interval == 0
                 )
                 if _capture:
-                    intermediate_latents.append(z_s_lfe[0].clone())
+                    # Captured after the update, so this latent sits at t = 1 - (ind+1)/lfe_steps.
+                    intermediate_latents.append((1.0 - (ind + 1) / lfe_steps, z_s_lfe[0].clone()))
         z_s_lfe = z_s_lfe[0]
+    else:
+        z_s_lfe = z_t_inv
 
     if inv_steps > 0 and noise_amt > 0.0:
         z_t_inv = z_s_lfe
-        dt = 1.0 / inv_steps
+        dt = noise_amt / inv_steps
         for ind, i in enumerate(np.linspace(noise_amt, 0, inv_steps+1)[:-1]):
             t = torch.Tensor([i]).to(device)
-            z_t_inv = z_t_inv + dt * model.model(z_t_inv, t, **tar_conditioning_inputs, cfg_scale=tar_inv_cfg_scale)
+            z_t_inv = z_t_inv - dt * model.model(z_t_inv, t, **tar_conditioning_inputs, cfg_scale=tar_inv_cfg_scale)
     else:
         z_t_inv = z_s_lfe
 
     sampled = z_t_inv
 
     intermediate_sampled = []
-    if return_intermediate_latents:
-        if inv_cfg_tradeoff_schedule is not None:
-            if inv_cfg_tradeoff_schedule == "linear":
-                inv_cfg_tradeoff_schedule = np.linspace(1, 0, inv_steps+1)[:-1]
-            elif inv_cfg_tradeoff_schedule == "cosine":
-                inv_cfg_tradeoff_schedule = np.cos(np.linspace(0, np.pi/2, inv_steps+1)[:-1])
-            elif inv_cfg_tradeoff_schedule == "step":
-                inv_cfg_tradeoff_schedule = np.where(np.linspace(0, 1, inv_steps+1)[:-1] < 0.5, 0, 1)
-            else:
-                raise ValueError(f"Unknown inv_cfg_tradeoff_schedule: {inv_cfg_tradeoff_schedule}")
-        for ind, intermediate_latent in enumerate(intermediate_latents):
+    if return_intermediate_latents and lfe_steps > 0:
+        # Source-prompt weight as a function of the LFE time t_c at which an intermediate
+        # was captured (1 = start of edit, 0 = end). Each intermediate is re-denoised with
+        # a fixed source/target mix given by its own t_c.
+        if inv_cfg_tradeoff_schedule == "linear":
+            src_weight_fn = lambda t_c: t_c
+        elif inv_cfg_tradeoff_schedule == "cosine":
+            src_weight_fn = lambda t_c: float(np.sin(t_c * np.pi / 2))
+        elif inv_cfg_tradeoff_schedule == "step":
+            src_weight_fn = lambda t_c: 1.0 if t_c >= 0.5 else 0.0
+        else:
+            raise ValueError(f"Unknown inv_cfg_tradeoff_schedule: {inv_cfg_tradeoff_schedule}")
+        for ind, (t_c, intermediate_latent) in enumerate(intermediate_latents):
             if model.pretransform is not None:
+                if noise_amt > 0.0 and inv_steps > 0:
+                    t_schedule = np.linspace(noise_amt, 0, inv_steps+1)[:-1]
+                    dt = noise_amt / inv_steps
+                    # Prompt embeddings are stored as [embeddings, attention_mask].
+                    src_prompt_emb, src_prompt_mask = src_conditioning_inputs_tensors["prompt"]
+                    tar_prompt_emb, _tar_prompt_mask = tar_conditioning_inputs_tensors["prompt"]
+                    src_conditioning_weight = src_weight_fn(t_c)
+                    tar_conditioning_weight = 1.0 - src_conditioning_weight
+                    mixed_prompt_emb = (
+                        src_conditioning_weight * src_prompt_emb
+                        + tar_conditioning_weight * tar_prompt_emb
+                    ).type(model_dtype)
+                    # Fresh dict so we never mutate the source conditioning tensors.
+                    mixed_conditioning_tensors = dict(src_conditioning_inputs_tensors)
+                    mixed_conditioning_tensors["prompt"] = [mixed_prompt_emb, src_prompt_mask]
+                    mixed_conditioning_inputs = model.get_conditioning_inputs(mixed_conditioning_tensors)
+                    for t_val in t_schedule:
+                        t = torch.Tensor([t_val]).repeat(intermediate_latent.shape[0]).to(device)
+                        intermediate_latent = intermediate_latent - dt * model.model(intermediate_latent, t, **mixed_conditioning_inputs, cfg_scale=lfe_cfg_scale)
+
                 intermediate_latent_val = intermediate_latent.to(next(model.pretransform.parameters()).dtype)
                 intermediate_latent_val = model.pretransform.decode(intermediate_latent_val)
             intermediate_sampled.append(intermediate_latent_val)

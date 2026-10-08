@@ -1,18 +1,23 @@
-"""Standalone Gradio interface for FlowEdit (deterministic inverse + LFE only).
+"""Standalone Gradio interface for LFE (Latent Flow Edit with partial inversion).
 
-Runs a single FlowEdit pass and shows NUM_COLS=10 outputs arranged in two
-rows of COLS_PER_ROW=5:
-  - (NUM_COLS - 1) = 9 intermediate latents decoded at steps chosen by:
-      • t=0.95 forced (always the second step, regardless of σ/center), and
-      • 8 additional steps drawn from a Gaussian centred at `sample_center`
-        (default 0.5) with spread `sample_std` along the t-schedule
-        (t=1 noisy → t=0 clean).
-  - 1 final decoded output (rightmost column, second row).
+This is a sibling of ``run_flowedit.py``. The key difference is that the
+``noise_amt`` knob is exposed in the UI (in ``run_flowedit.py`` it is hard-wired
+to 0). With ``noise_amt > 0`` the pipeline additionally performs a partial
+inversion (forward + backward), and the captured intermediate latents are
+re-denoised to t=0 using:
 
-The `sample_std` slider lets you control how concentrated the intermediate
-captures are around the centre:
-  - small σ → all captures cluster tightly around the centre t-value
-  - large σ → captures spread toward both ends of the trajectory
+  - ``lfe_cfg_scale``            : CFG scale used while re-denoising intermediates.
+  - ``inv_cfg_tradeoff_schedule``: how the prompt conditioning is traded off
+                                   between source and target across the
+                                   re-denoising trajectory (linear/cosine/step).
+
+Both of these controls, plus ``noise_amt``, ``inv_steps``, the full set of CFG
+scales and a ``deterministic_inverse`` toggle, are exposed in the Gradio UI.
+
+Like ``run_flowedit.py`` it shows NUM_COLS=10 outputs arranged in two rows of
+COLS_PER_ROW=5: (NUM_COLS - 1) = 9 intermediate latents decoded at steps chosen
+by a Gaussian centred at ``sample_center`` (t=1 noisy -> t=0 clean) with spread
+``sample_std``, plus 1 final decoded output (rightmost column, second row).
 """
 
 import argparse
@@ -43,6 +48,10 @@ model_half = True
 NUM_COLS = 10
 COLS_PER_ROW = 5
 
+# Options for the inv_cfg_tradeoff_schedule dropdown (must match the schedules
+# handled inside generate_diffusion_latent_flowedit).
+TRADEOFF_SCHEDULES = ["linear", "cosine", "step"]
+
 
 def _pad(lst, n, fill=None):
     lst = list(lst)
@@ -50,8 +59,17 @@ def _pad(lst, n, fill=None):
 
 
 def _t_to_step(t: float, lfe_steps: int) -> int:
-    """Convert a t-value in [0, 1] to the nearest LFE step index."""
-    return int(np.clip(np.round((1.0 - t) * (lfe_steps)), 0, lfe_steps))
+    """Convert a t-value in [0, 1] to the nearest LFE step index.
+
+    The latent at step ``ind`` is captured after that step's update, so it sits at
+    t = 1 - (ind + 1) / lfe_steps (see ``_step_to_t``).
+    """
+    return int(np.clip(np.round((1.0 - t) * lfe_steps) - 1, 0, lfe_steps - 1))
+
+
+def _step_to_t(ind: int, lfe_steps: int) -> float:
+    """t-value of the latent captured at LFE step ``ind`` (inverse of ``_t_to_step``)."""
+    return round(1.0 - (ind + 1) / max(lfe_steps, 1), 3)
 
 
 def _aligned_sample_size(num_samples: int) -> int:
@@ -91,8 +109,8 @@ def _gaussian_step_indices(
     The remaining (n_samples - len(forced)) indices are drawn via evenly-spaced
     Gaussian quantiles centred at `center` with spread `std`.
 
-    The t-schedule runs t=1 (noisy) → t=0 (clean).
-    t → step_index:  ind = round((1 - t) * (lfe_steps - 1))
+    The t-schedule runs t=1 (noisy) -> t=0 (clean).
+    t -> step_index:  ind = round((1 - t) * lfe_steps) - 1   (see ``_t_to_step``)
     """
     if lfe_steps <= 0:
         return []
@@ -129,20 +147,6 @@ def load_model(
         model = StableAudioModel.from_pretrained(pretrained_name, device=device, model_half=in_model_half)
     else:
         raise ValueError("No pretrained model or model config provided")
-
-    # sample_rate = model.sample_rate
-    # sample_size = model.model_config["sample_size"]
-
-    # if pretransform_ckpt_path is not None:
-    #     print(f"Loading pretransform checkpoint from {pretransform_ckpt_path}")
-    #     model.pretransform.load_state_dict(
-    #         load_ckpt_state_dict(pretransform_ckpt_path), strict=False
-    #     )
-
-    # model.to(device).eval().requires_grad_(False)
-    # if in_model_half:
-    #     model.to(torch.float16)
-    # model_half = in_model_half
 
     print("Done loading model")
     return model, model_config
@@ -222,40 +226,54 @@ def _sampled_to_outputs(sampled, save_path=None, spec_figsize=(3, 2), max_len=No
     return (sample_rate, audio_np), [spectrogram]
 
 
-def _run_flowedit(
+def _run_lfe(
     src_conditioning_inputs,
     tar_conditioning_inputs,
+    src_conditioning_inputs_tensors,
+    tar_conditioning_inputs_tensors,
     init_audio,
     device,
     seed,
     src_inv_cfg_scale,
     tar_inv_cfg_scale,
+    src_lfe_cfg_scale,
+    tar_lfe_cfg_scale,
+    lfe_cfg_scale,
     lfe_steps,
+    inv_steps,
     n_avg,
+    noise_amt,
+    deterministic_inverse,
+    inv_cfg_tradeoff_schedule,
     intermediate_latents_steps,
     run_sample_size,
     batch_size=1,
 ):
 
-    print(src_conditioning_inputs)
     sampled, intermediate_sampled = generate_diffusion_latent_flowedit(
         model=model.model,
-        steps=int(lfe_steps),
-        src_cfg_scale=float(src_inv_cfg_scale),
-        tar_cfg_scale=float(tar_inv_cfg_scale),
+        src_inv_cfg_scale=float(src_inv_cfg_scale),
+        tar_inv_cfg_scale=float(tar_inv_cfg_scale),
+        src_lfe_cfg_scale=float(src_lfe_cfg_scale),
+        tar_lfe_cfg_scale=float(tar_lfe_cfg_scale),
+        lfe_cfg_scale=float(lfe_cfg_scale),
         src_conditioning_inputs=src_conditioning_inputs,
         tar_conditioning_inputs=tar_conditioning_inputs,
+        src_conditioning_inputs_tensors=src_conditioning_inputs_tensors,
+        tar_conditioning_inputs_tensors=tar_conditioning_inputs_tensors,
         init_audio=init_audio,
         device=device,
         n_avg=int(n_avg),
         batch_size=batch_size,
         sample_size=run_sample_size,
         seed=int(seed),
-        inv_steps=0,
+        deterministic_inverse=bool(deterministic_inverse),
+        noise_amt=float(noise_amt),
+        inv_steps=int(inv_steps),
         lfe_steps=int(lfe_steps),
+        inv_cfg_tradeoff_schedule=inv_cfg_tradeoff_schedule,
         return_intermediate_latents=True,
         intermediate_latents_steps=intermediate_latents_steps,
-        noise_amt=0,
     )
 
     if torch.cuda.is_available():
@@ -266,8 +284,15 @@ def _run_flowedit(
 
 def generate_edit(
     init_audio_input,
+    src_lfe_cfg_scale,
+    tar_lfe_cfg_scale,
     src_inv_cfg_scale,
     tar_inv_cfg_scale,
+    lfe_cfg_scale,
+    noise_amt,
+    inv_steps,
+    deterministic_inverse,
+    inv_cfg_tradeoff_schedule,
     lfe_steps,
     n_avg,
     sample_center=0.5,
@@ -293,15 +318,25 @@ def generate_edit(
         except (TypeError, ValueError):
             return default
 
-    src_inv_cfg_scale  = _to_float(src_inv_cfg_scale,  1.0)
-    tar_inv_cfg_scale  = _to_float(tar_inv_cfg_scale,  5.0)
-    lfe_steps          = _to_int(lfe_steps,             20)
-    n_avg              = _to_int(n_avg,                 10)
-    sample_center      = _to_float(sample_center,       0.5)
-    sample_std         = _to_float(sample_std,          0.15)
-    seconds_total      = _to_int(seconds_total,         30)
-    # if not src_prompt or not tar_prompt:
-    #     raise gr.Error("Please provide both a source and a target prompt.")
+    src_lfe_cfg_scale = _to_float(src_lfe_cfg_scale, 6.0)
+    tar_lfe_cfg_scale = _to_float(tar_lfe_cfg_scale, 6.0)
+    src_inv_cfg_scale = _to_float(src_inv_cfg_scale, 1.0)
+    tar_inv_cfg_scale = _to_float(tar_inv_cfg_scale, 6.0)
+    lfe_cfg_scale = _to_float(lfe_cfg_scale, 6.0)
+    noise_amt = _to_float(noise_amt, 0.3)
+    inv_steps = _to_int(inv_steps, 10)
+    lfe_steps = _to_int(lfe_steps, 20)
+    n_avg = _to_int(n_avg, 10)
+    sample_center = _to_float(sample_center, 0.5)
+    sample_std = _to_float(sample_std, 0.15)
+    seconds_total = _to_int(seconds_total, 30)
+
+    if inv_cfg_tradeoff_schedule not in TRADEOFF_SCHEDULES:
+        inv_cfg_tradeoff_schedule = "linear"
+
+    # noise_amt must stay < 1.0: the LFE loop (which produces z_s_lfe) only runs
+    # when noise_amt < 1.0, and everything downstream depends on it.
+    noise_amt = float(np.clip(noise_amt, 0.0, 0.999))
 
     device = next(model.model.parameters()).device
 
@@ -311,7 +346,7 @@ def generate_edit(
     input_len = init_audio[1].shape[-1]
     run_sample_size = _aligned_sample_size(input_len)
     print(
-        f"[gradio_flowedit] input_len={input_len} "
+        f"[gradio_lfe] input_len={input_len} "
         f"({input_len / sample_rate:.2f}s) -> run_sample_size={run_sample_size} "
         f"({run_sample_size / sample_rate:.2f}s)"
     )
@@ -341,12 +376,10 @@ def generate_edit(
         torch.cuda.empty_cache()
     gc.collect()
 
-    
-
     seed = int(seed) if seed and seed.strip() else -1
     if seed == -1:
         seed = int(np.random.randint(0, 2**32 - 1, dtype=np.uint32))
-    print(f"[gradio_flowedit] seed={seed}")
+    print(f"[gradio_lfe] seed={seed}")
 
     # Compute which LFE step indices to capture (NUM_COLS - 1 intermediates).
     n_intermediates = NUM_COLS - 1
@@ -356,21 +389,34 @@ def generate_edit(
         center=sample_center,
         std=sample_std,
     )
-    # Corresponding t-values for display (t = 1 - ind/(lfe_steps-1))
-    t_labels = [round(1.0 - idx / max(lfe_steps, 1), 3) for idx in step_indices]
-    print(f"[gradio_flowedit] capturing steps {step_indices} (t={t_labels})")
+    # Corresponding t-values for display (t = 1 - (ind+1)/lfe_steps)
+    t_labels = [_step_to_t(idx, lfe_steps) for idx in step_indices]
+    print(
+        f"[gradio_lfe] noise_amt={noise_amt} inv_steps={inv_steps} "
+        f"deterministic_inverse={deterministic_inverse} "
+        f"inv_cfg_tradeoff_schedule={inv_cfg_tradeoff_schedule}"
+    )
+    print(f"[gradio_lfe] capturing steps {step_indices} (t={t_labels})")
 
-
-    sampled, intermediate_sampled = _run_flowedit(
+    sampled, intermediate_sampled = _run_lfe(
         src_conditioning_inputs=src_conditioning_inputs,
         tar_conditioning_inputs=tar_conditioning_inputs,
+        src_conditioning_inputs_tensors=src_conditioning_inputs_tensors,
+        tar_conditioning_inputs_tensors=tar_conditioning_inputs_tensors,
         init_audio=init_audio,
         device=device,
         seed=seed,
         src_inv_cfg_scale=src_inv_cfg_scale,
         tar_inv_cfg_scale=tar_inv_cfg_scale,
+        src_lfe_cfg_scale=src_lfe_cfg_scale,
+        tar_lfe_cfg_scale=tar_lfe_cfg_scale,
+        lfe_cfg_scale=lfe_cfg_scale,
         lfe_steps=lfe_steps,
+        inv_steps=inv_steps,
         n_avg=n_avg,
+        noise_amt=noise_amt,
+        deterministic_inverse=deterministic_inverse,
+        inv_cfg_tradeoff_schedule=inv_cfg_tradeoff_schedule,
         intermediate_latents_steps=step_indices,
         run_sample_size=run_sample_size,
     )
@@ -380,14 +426,14 @@ def generate_edit(
     for col_idx, (intermediate, t_val) in enumerate(zip(intermediate_sampled, t_labels)):
         audio, specs = _sampled_to_outputs(
             intermediate,
-            save_path=f"flowedit_intermediate_{col_idx}_t{t_val}.wav",
+            save_path=f"lfe_intermediate_{col_idx}_t{t_val}.wav",
             max_len=input_len,
         )
         audio_list.append(audio)
         specs_list.append(specs)
 
     final_audio, final_specs = _sampled_to_outputs(
-        sampled, save_path="flowedit_final.wav", max_len=input_len
+        sampled, save_path="lfe_final.wav", max_len=input_len
     )
     audio_list.append(final_audio)
     specs_list.append(final_specs)
@@ -425,15 +471,42 @@ def create_edit_ui(gradio_title=""):
             with gr.Column():
                 init_audio_input = gr.Audio(label="Init audio", type="filepath")
             with gr.Column():
-                gr.Markdown("**CFG scales**")
+                gr.Markdown("**LFE CFG scales**")
+                with gr.Row():
+                    src_lfe_cfg = gr.Slider(0.0, 25.0, value=6.0, step=0.1, label="src_lfe_cfg_scale")
+                    tar_lfe_cfg = gr.Slider(0.0, 25.0, value=6.0, step=0.1, label="tar_lfe_cfg_scale")
+
+                gr.Markdown("**Inversion / re-denoising**")
+                with gr.Row():
+                    noise_amt = gr.Slider(
+                        0.0, 0.999, value=0.3, step=0.01,
+                        label="noise_amt (0 = pure FlowEdit; >0 enables inversion)",
+                    )
+                    inv_steps = gr.Slider(
+                        0, 100, value=10, step=1,
+                        label="inv_steps (needs > 0 for lfe_cfg / tradeoff to matter)",
+                    )
                 with gr.Row():
                     src_inv_cfg = gr.Slider(0.0, 25.0, value=1.0, step=0.1, label="src_inv_cfg_scale")
-                    tar_inv_cfg = gr.Slider(0.0, 25.0, value=5.0, step=0.1, label="tar_inv_cfg_scale")
-
+                    tar_inv_cfg = gr.Slider(0.0, 25.0, value=6.0, step=0.1, label="tar_inv_cfg_scale")
+                with gr.Row():
+                    lfe_cfg = gr.Slider(
+                        0.0, 25.0, value=6.0, step=0.1,
+                        label="lfe_cfg_scale (intermediate re-denoising CFG)",
+                    )
+                    inv_cfg_tradeoff_schedule = gr.Dropdown(
+                        choices=TRADEOFF_SCHEDULES,
+                        value="linear",
+                        label="inv_cfg_tradeoff_schedule",
+                    )
+                deterministic_inverse = gr.Checkbox(
+                    value=True,
+                    label="deterministic_inverse (ODE inversion; off = random noise mixing)",
+                )
 
                 with gr.Accordion("Edit params", open=False):
                     with gr.Row():
-                        lfe_steps = gr.Slider(1, 200, value=20, step=1, label="fe_steps")
+                        lfe_steps = gr.Slider(0, 200, value=20, step=1, label="lfe_steps")
                         n_avg = gr.Slider(1, 20, value=10, step=1, label="n_avg")
                         seconds_total = gr.Slider(1, 300, value=30, step=20, label="seconds_total")
                     with gr.Row():
@@ -447,7 +520,7 @@ def create_edit_ui(gradio_title=""):
                         )
                     seed_textbox = gr.Textbox(label="Seed (-1 for random)", value="-1")
 
-        gr.Markdown("### FlowEdit outputs (intermediates + final)")
+        gr.Markdown("### LFE outputs (intermediates + final)")
         audio_outputs = []
         spec_galleries = []
         col_label_components = []
@@ -474,8 +547,15 @@ def create_edit_ui(gradio_title=""):
             fn=generate_edit,
             inputs=[
                 init_audio_input,
+                src_lfe_cfg,
+                tar_lfe_cfg,
                 src_inv_cfg,
                 tar_inv_cfg,
+                lfe_cfg,
+                noise_amt,
+                inv_steps,
+                deterministic_inverse,
+                inv_cfg_tradeoff_schedule,
                 lfe_steps,
                 n_avg,
                 sample_center,
@@ -518,9 +598,18 @@ def _mount_api(interface):
             src_prompt   = body["src_prompt"]
             tar_prompt   = body["tar_prompt"]
             lfe_steps    = int(body.get("lfe_steps", 20))
+            inv_steps    = int(body.get("inv_steps", 10))
             n_avg        = int(body.get("n_avg", 10))
-            src_cfg      = float(body.get("src_lfe_cfg_scale", 1.0))
-            tar_cfg      = float(body.get("tar_lfe_cfg_scale", 3.0))
+            src_lfe_cfg  = float(body.get("src_lfe_cfg_scale", 6.0))
+            tar_lfe_cfg  = float(body.get("tar_lfe_cfg_scale", 6.0))
+            src_inv_cfg  = float(body.get("src_inv_cfg_scale", 1.0))
+            tar_inv_cfg  = float(body.get("tar_inv_cfg_scale", 6.0))
+            lfe_cfg      = float(body.get("lfe_cfg_scale", 6.0))
+            noise_amt    = float(np.clip(float(body.get("noise_amt", 0.3)), 0.0, 0.999))
+            deterministic_inverse = bool(body.get("deterministic_inverse", True))
+            inv_cfg_tradeoff_schedule = body.get("inv_cfg_tradeoff_schedule", "linear")
+            if inv_cfg_tradeoff_schedule not in TRADEOFF_SCHEDULES:
+                inv_cfg_tradeoff_schedule = "linear"
             num_inter    = int(body.get("num_intermediates", 9))
             center       = float(body.get("sample_center", 0.5))
             std          = float(body.get("sample_std", 0.15))
@@ -549,15 +638,15 @@ def _mount_api(interface):
             inpaint_mask = torch.zeros(batch_size, 1, latent_sample_size, device=device)
             inpaint_masked_input = torch.zeros(batch_size, io_channels, latent_sample_size, device=device)
 
-            src_cond = model.model.conditioner(src_cond_raw, device)
-            src_cond["inpaint_mask"] = [inpaint_mask]
-            src_cond["inpaint_masked_input"] = [inpaint_masked_input]
-            src_cond = model.model.get_conditioning_inputs(src_cond)
+            src_cond_tensors = model.model.conditioner(src_cond_raw, device)
+            src_cond_tensors["inpaint_mask"] = [inpaint_mask]
+            src_cond_tensors["inpaint_masked_input"] = [inpaint_masked_input]
+            src_cond = model.model.get_conditioning_inputs(src_cond_tensors)
 
-            tar_cond = model.model.conditioner(tar_cond_raw, device)
-            tar_cond["inpaint_mask"] = [inpaint_mask]
-            tar_cond["inpaint_masked_input"] = [inpaint_masked_input]
-            tar_cond = model.model.get_conditioning_inputs(tar_cond)
+            tar_cond_tensors = model.model.conditioner(tar_cond_raw, device)
+            tar_cond_tensors["inpaint_mask"] = [inpaint_mask]
+            tar_cond_tensors["inpaint_masked_input"] = [inpaint_masked_input]
+            tar_cond = model.model.get_conditioning_inputs(tar_cond_tensors)
 
             if seed == -1:
                 seed = int(np.random.randint(0, 2**32 - 1, dtype=np.uint32))
@@ -565,19 +654,28 @@ def _mount_api(interface):
             step_indices = _gaussian_step_indices(
                 lfe_steps=lfe_steps, n_samples=num_inter, center=center, std=std,
             )
-            t_labels = [round(1.0 - idx / max(lfe_steps - 1, 1), 3) for idx in step_indices]
+            t_labels = [_step_to_t(idx, lfe_steps) for idx in step_indices]
 
             sampled, intermediate_sampled = await asyncio.to_thread(
-                _run_flowedit,
+                _run_lfe,
                 src_conditioning_inputs=src_cond,
                 tar_conditioning_inputs=tar_cond,
+                src_conditioning_inputs_tensors=src_cond_tensors,
+                tar_conditioning_inputs_tensors=tar_cond_tensors,
                 init_audio=init_audio,
                 device=device,
                 seed=seed,
-                src_inv_cfg_scale=src_cfg,
-                tar_inv_cfg_scale=tar_cfg,
+                src_inv_cfg_scale=src_inv_cfg,
+                tar_inv_cfg_scale=tar_inv_cfg,
+                src_lfe_cfg_scale=src_lfe_cfg,
+                tar_lfe_cfg_scale=tar_lfe_cfg,
+                lfe_cfg_scale=lfe_cfg,
                 lfe_steps=lfe_steps,
+                inv_steps=inv_steps,
                 n_avg=n_avg,
+                noise_amt=noise_amt,
+                deterministic_inverse=deterministic_inverse,
+                inv_cfg_tradeoff_schedule=inv_cfg_tradeoff_schedule,
                 intermediate_latents_steps=step_indices,
                 run_sample_size=run_sample_size,
             )
@@ -627,12 +725,12 @@ def main(args):
         device=device,
     )
 
-    interface = create_edit_ui(gradio_title=args.title or "FlowEdit")
+    interface = create_edit_ui(gradio_title=args.title or "LFE")
     interface.queue()
     interface.launch(
         share=args.share,
         auth=(args.username, args.password) if args.username is not None else None,
-        server_port=7882,
+        server_port=args.port,
         prevent_thread_lock=True,
     )
     _mount_api(interface)
@@ -640,7 +738,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run FlowEdit gradio interface")
+    parser = argparse.ArgumentParser(description="Run LFE (Latent Flow Edit) gradio interface")
     parser.add_argument("--pretrained-name", type=str, required=False)
     parser.add_argument("--model-config", type=str, required=False)
     parser.add_argument("--ckpt-path", type=str, required=False)
@@ -649,6 +747,7 @@ if __name__ == "__main__":
     parser.add_argument("--username", type=str, required=False)
     parser.add_argument("--password", type=str, required=False)
     parser.add_argument("--model-half", action="store_true", default=True)
-    parser.add_argument("--title", type=str, required=False, default="FlowEdit")
+    parser.add_argument("--title", type=str, required=False, default="LFE")
+    parser.add_argument("--port", type=int, required=False, default=7883)
     args = parser.parse_args()
     main(args)
