@@ -651,9 +651,17 @@ def _mount_api(interface):
             if seed == -1:
                 seed = int(np.random.randint(0, 2**32 - 1, dtype=np.uint32))
 
-            step_indices = _gaussian_step_indices(
-                lfe_steps=lfe_steps, n_samples=num_inter, center=center, std=std,
-            )
+            # Optional explicit t values (1 = noisy, 0 = clean), e.g. evenly spaced in a range.
+            # Each snaps to the nearest LFE step; duplicates collapse. Otherwise the Gaussian pick.
+            inter_t = body.get("intermediate_t")
+            if inter_t:
+                step_indices = sorted({
+                    _t_to_step(float(np.clip(float(t), 0.0, 1.0)), lfe_steps) for t in inter_t
+                })
+            else:
+                step_indices = _gaussian_step_indices(
+                    lfe_steps=lfe_steps, n_samples=num_inter, center=center, std=std,
+                )
             t_labels = [_step_to_t(idx, lfe_steps) for idx in step_indices]
 
             sampled, intermediate_sampled = await asyncio.to_thread(
@@ -691,7 +699,7 @@ def _mount_api(interface):
 
             return JSONResponse({
                 "intermediates": [
-                    {"label": f"t={t}", "audio_b64": to_b64(inter)}
+                    {"label": f"t={t}", "t": t, "audio_b64": to_b64(inter)}
                     for t, inter in zip(t_labels, intermediate_sampled)
                 ],
                 "final": {"label": "Final", "audio_b64": to_b64(sampled)},
