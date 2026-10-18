@@ -19,10 +19,19 @@ import argparse
 import gc
 import json
 
+import os
+import tempfile
+
+# ROCm: the fused SDPA kernels on gfx1151 are gated behind this flag (torch warns
+# "Mem Efficient attention on Current AMD GPU is still experimental"); with it a DiT
+# pass drops from ~50 ms to ~35 ms. Harmless on CUDA/CPU. Set in the shell to override.
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+
 import gradio as gr
 import numpy as np
 import torch
 import soundfile as sf
+from scipy.io import wavfile
 import torchaudio
 from einops import rearrange
 from torchaudio import transforms as T
@@ -36,7 +45,6 @@ from scipy.stats import norm as scipy_norm
 model = None
 sample_rate = 44100
 sample_size = 2097152
-model_half = True
 
 # Number of output columns: (NUM_COLS - 1) intermediates + 1 final.
 # Rendered as two rows of COLS_PER_ROW each.
@@ -123,7 +131,7 @@ def load_model(
     device="cuda",
     in_model_half=False,
 ):
-    global model, sample_rate, sample_size, model_half
+    global model, sample_rate, sample_size
 
     if pretrained_name is not None:
         model = StableAudioModel.from_pretrained(pretrained_name, device=device, model_half=in_model_half)
@@ -142,7 +150,6 @@ def load_model(
     # model.to(device).eval().requires_grad_(False)
     # if in_model_half:
     #     model.to(torch.float16)
-    # model_half = in_model_half
 
     print("Done loading model")
     return model, model_config
@@ -189,8 +196,9 @@ def _prepare_init_audio(init_audio_input):
     else:
         raise ValueError(f"Unsupported audio dtype: {audio.dtype}")
 
-    if model_half:
-        audio = audio.to(torch.float16)
+    # Match the loaded model's dtype (float16 only when the model itself is
+    # half) so the resampler and the autoencoder encode see a consistent dtype.
+    audio = audio.to(next(model.model.parameters()).dtype)
 
     if audio.dim() == 1:
         audio = audio.unsqueeze(0)
@@ -215,7 +223,7 @@ def _sampled_to_outputs(sampled, save_path=None, spec_figsize=(3, 2), max_len=No
     audio_int16 = audio.div(peak).clamp(-1, 1).mul(32767).to(torch.int16)
 
     if save_path is not None:
-        torchaudio.save(save_path, audio_int16, sample_rate)
+        sf.write(save_path, audio_int16.numpy().T, sample_rate, subtype="PCM_16")
 
     spectrogram = audio_spectrogram_image(audio_int16, sample_rate=sample_rate, figsize=spec_figsize)
     audio_np = audio_int16.numpy().T
@@ -529,9 +537,16 @@ def _mount_api(interface):
 
             # Decode audio and build init_audio_input tuple
             audio_bytes = base64.b64decode(body["audio_b64"])
-            waveform, in_sr = torchaudio.load(_io.BytesIO(audio_bytes))
-            # _prepare_init_audio expects (sr, numpy array) with shape (samples, channels)
-            init_audio_input = (in_sr, waveform.numpy().T)
+            # Decode via a temp file so libsndfile handles any container the client
+            # sent (soundfile's in-memory path needs cffi callbacks, which break on
+            # this host's libffi). _load_audio_file returns (sr, (samples[, channels])).
+            with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+            try:
+                init_audio_input = _load_audio_file(tmp_path)
+            finally:
+                os.unlink(tmp_path)
 
             device = next(model.model.parameters()).device
             batch_size = 1
@@ -588,7 +603,7 @@ def _mount_api(interface):
                 peak = audio.abs().max().clamp(min=1e-8)
                 audio_int16 = audio.div(peak).clamp(-1, 1).mul(32767).to(torch.int16)
                 buf = _io.BytesIO()
-                torchaudio.save(buf, audio_int16, sample_rate, format="wav")
+                wavfile.write(buf, sample_rate, audio_int16.numpy().T)
                 return base64.b64encode(buf.getvalue()).decode()
 
             return JSONResponse({

@@ -12,6 +12,7 @@ dependencies = [
     "safetensors>=0.7.0",
     "torch>=2.8.0",
     "torchaudio>=2.8.0",
+    "triton-rocm>=3.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "tqdm>=4.67.3",
     "huggingface-hub>=1.7.1",
     "transformers>=5.8.0",
@@ -31,17 +32,25 @@ lora = [
   "dill>=0.4.1",
 ]
 
+# ROCm 7.2 torch builds for the AMD Radeon 8060S (gfx1151) dev machine. The CUDA
+# wheel runs the model on the CPU there; the ROCm wheel exposes the GPU through
+# torch.cuda. Same stack as ~/Projects/snnithya/sa3-inference. torchaudio 2.11.0 is
+# the only rocm7.2 wheel, so torch is pinned to match it.
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-rocm72"
+url = "https://download.pytorch.org/whl/rocm7.2"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+  { index = "pytorch-rocm72", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
 ]
 torchaudio = [
-  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+  { index = "pytorch-rocm72", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+]
+# transitive dep of the ROCm torch wheel; declared as a source so uv resolves it from the same index
+triton-rocm = [
+  { index = "pytorch-rocm72", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
 ]
 
 [project.scripts]
@@ -72,3 +81,8 @@ exclude = [
 
 [tool.uv]
 cache-dir = ".uv-cache"
+# torchaudio 2.11.0 is the only rocm7.2 wheel, so torch is held to the same version there.
+constraint-dependencies = [
+  "torch==2.11.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "torchaudio==2.11.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]

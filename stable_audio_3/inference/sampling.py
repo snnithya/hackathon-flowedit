@@ -617,6 +617,7 @@ def generate_diffusion_latent_flowedit(
 
         # For latent models, encode the initial audio into latents
         if model.pretransform is not None:
+            init_audio = init_audio.to(next(model.pretransform.parameters()).dtype)
             init_audio = model.pretransform.encode(init_audio)
 
         init_audio = init_audio.repeat(batch_size, 1, 1)
